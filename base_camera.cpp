@@ -5,6 +5,8 @@
 #include <thread>
 
 #include <unistd.h>
+#include "libtime/libtime.h"
+
 
 #define RING_BUFFER_FRAME_COUNT 3
 
@@ -12,9 +14,9 @@ struct Frame {
     int id;
     long long time_produce;
     long long time_enqueue;
+    long long time_dequeue;
 };
 
-static double dur_ms(long long us) { return us / 1000.0; } /* 只为打印好看 */
 
 struct Streambuffer {
     Frame frame[RING_BUFFER_FRAME_COUNT];
@@ -52,6 +54,7 @@ static void frame_put(Frame &frame) {
     }
 
     sb.frame[sb.cur_write] = frame;
+    sb.frame[sb.cur_write].time_enqueue = get_tick_count();
     sb.cur_write = (sb.cur_write + 1) % RING_BUFFER_FRAME_COUNT;
     sb.count++;
 
@@ -71,6 +74,7 @@ static int frame_get(Frame *out) {
     }
 
     *out = sb.frame[sb.cur_read];
+    out->time_dequeue=get_tick_count();
     sb.cur_read = (sb.cur_read + 1) % RING_BUFFER_FRAME_COUNT;
     sb.count--;
 
@@ -82,11 +86,12 @@ static int frame_get(Frame *out) {
 static void *producer(void *) {
     // generate a frame per 40ms
     int i = 0;
-    while (i <= 10) {
-        usleep(40);
+    while (i < 100) {
+        usleep(40*1000);
 
         Frame f;
         f.id = i;
+        f.time_produce=get_tick_count();
         i++;
         frame_put(f);
 
@@ -103,8 +108,10 @@ static void *cumsumer(void *) {
     Frame f;
     while (frame_get(&f) == 0) {
         // bianma frame
-        usleep(100);
-        printf("get frame %d\n", f.id);
+        usleep(100*1000);
+        printf("get frame %d,%lld,%lld,%lld\n", f.id,f.time_produce,f.time_enqueue,f.time_dequeue);
+        printf("frame %d waits %lld for get in ringbuffer, waits for %lld for get out form ringbuffer\n",f.id,
+            f.time_enqueue-f.time_produce, f.time_dequeue-f.time_enqueue);
     }
 
     printf("over !!!!!!!!");
@@ -113,6 +120,7 @@ static void *cumsumer(void *) {
 
 int main() {
     sb_init();
+    init_time();
 
     pthread_t tp, tc;
     if (pthread_create(&tp, nullptr, producer, nullptr) != 0) {
