@@ -3,12 +3,19 @@
 #include <chrono>
 #include <cstdio>
 #include <thread>
+#include <cstdlib>
 
 #include <unistd.h>
 #include "libtime/libtime.h"
 
 
 #define RING_BUFFER_FRAME_COUNT 3
+
+enum v_policy{
+    WAIT_THE_MUTEX,
+    DROP_THE_NEWEST,
+    COVER_THE_OLDEST
+};
 
 struct Frame {
     int id;
@@ -24,6 +31,7 @@ struct Streambuffer {
     int cur_read;
     int count;
     int limit = RING_BUFFER_FRAME_COUNT;
+    v_policy policy;
     pthread_mutex_t mtx;
     pthread_cond_t no_empty;
     pthread_cond_t no_full;
@@ -34,7 +42,8 @@ struct Streambuffer {
 
 static Streambuffer sb;
 
-static void sb_init() {
+static void sb_init(v_policy p) {
+    sb.policy=p;
     pthread_mutex_init(&sb.mtx, nullptr);
     pthread_cond_init(&sb.no_empty, nullptr);
     pthread_cond_init(&sb.no_full, nullptr);
@@ -44,13 +53,42 @@ static void sb_done() {
     pthread_mutex_lock(&sb.mtx);
     sb.shut_down = 1;
     pthread_cond_broadcast(&sb.no_empty);
+    pthread_cond_broadcast(&sb.no_full);
     pthread_mutex_unlock(&sb.mtx);
 }
 
-static void frame_put(Frame &frame) {
+static int frame_put(Frame &frame) {
     pthread_mutex_lock(&sb.mtx);
-    while (sb.count == RING_BUFFER_FRAME_COUNT) {
-        pthread_cond_wait(&sb.no_full, &sb.mtx);
+    // while (sb.count == RING_BUFFER_FRAME_COUNT && !sb.shut_down) {
+    //     pthread_cond_wait(&sb.no_full, &sb.mtx);
+    // }
+    if(sb.count == RING_BUFFER_FRAME_COUNT){
+        switch (sb.policy) {
+            case WAIT_THE_MUTEX:
+                while (sb.count == RING_BUFFER_FRAME_COUNT && !sb.shut_down) 
+                {
+                    pthread_cond_wait(&sb.no_full, &sb.mtx);
+                }
+                break;
+            case DROP_THE_NEWEST:
+                sb.drops++;
+                pthread_mutex_unlock(&sb.mtx);
+                return 0;
+            case COVER_THE_OLDEST:
+                sb.cur_read = (sb.cur_read + 1) % RING_BUFFER_FRAME_COUNT;
+                sb.count--;
+                sb.drops++;
+                break;
+            default:
+                printf("err policy\n");
+        }
+    }
+
+
+    if(sb.shut_down)
+    {
+        pthread_mutex_unlock(&sb.mtx);
+        return -1;
     }
 
     sb.frame[sb.cur_write] = frame;
@@ -60,6 +98,7 @@ static void frame_put(Frame &frame) {
 
     pthread_cond_signal(&sb.no_empty);
     pthread_mutex_unlock(&sb.mtx);
+    return  0;
 }
 
 static int frame_get(Frame *out) {
@@ -93,12 +132,15 @@ static void *producer(void *) {
         f.id = i;
         f.time_produce=get_tick_count();
         i++;
-        frame_put(f);
+        if(frame_put(f) != 0){
+            printf("get signal shutdown!!!!!!!!!!!!\n");
+        } else {
+            printf("frame_put %d\n", f.id);
+        }
 
-        printf("frame_put %d\n", f.id);
     }
 
-    printf("shutdown!!!!!!!!!!!!");
+    printf("shutdown!!!!!!!!!!!!\n");
     sb_done();
     return NULL;
 }
@@ -114,12 +156,29 @@ static void *cumsumer(void *) {
             f.time_enqueue-f.time_produce, f.time_dequeue-f.time_enqueue);
     }
 
-    printf("over !!!!!!!!");
+    printf("over !!!!!!!!\n");
     return NULL;
 }
 
-int main() {
-    sb_init();
+int main(int argc, char *argv[]) {
+
+    v_policy policy;
+    switch(atoi(argv[1]))
+    {
+        case 0:
+            policy= WAIT_THE_MUTEX;
+            break;
+        case 1:
+            policy= DROP_THE_NEWEST;
+            break;
+        case 2:
+            policy= COVER_THE_OLDEST;
+            break;
+        default:
+            printf("inllegal param");
+            break;
+    }
+    sb_init(policy);
     init_time();
 
     pthread_t tp, tc;
@@ -132,6 +191,8 @@ int main() {
 
     pthread_join(tp, nullptr);
     pthread_join(tc, nullptr);
+
+    printf("policy=%d, drops=%d\n", (int)sb.policy, sb.drops);
 
     pthread_mutex_destroy(&sb.mtx);
     pthread_cond_destroy(&sb.no_empty);
